@@ -109,7 +109,7 @@ def test_prepare_next_match_disarms_automation_and_requires_fresh_empty_board() 
     assert not app.game_auto_execution_var.get()
     assert app.reference_invalidated
     assert app.game_phase_var.get() == "准备下一局：请先清空实体棋盘"
-    assert "保存空棋盘基准" in app.game_plan_var.get()
+    assert "保存空盘基准" in app.game_plan_var.get()
     assert len(rendered_boards) == 1
     assert "advanced_match_reset_for_next_game" in events
 
@@ -416,6 +416,29 @@ def test_turntable_status_omits_manual_angle_confirmation_note() -> None:
     DiagnosticApp._set_turntable_state(app, "90°取子", 2800)
 
     assert app.servo_var.get() == "取子机构舵机调试台：已发送 90°取子，占空比 2800"
+    assert app.turntable_duty == 2800
+
+
+def test_saving_empty_board_returns_an_extended_turntable_to_storage_first() -> None:
+    turntable_calls = []
+    saved = []
+    app = SimpleNamespace(
+        last_frame=object(),
+        hardware_busy=False,
+        foundation_calibration=SimpleNamespace(turntable_receive_duty=6000),
+        hardware=SimpleNamespace(connected=True, turntable=lambda duty: turntable_calls.append(duty) or object()),
+        turntable_duty=2800,
+        status_var=FakeVariable(),
+        servo_var=FakeVariable(),
+    )
+    app._hardware_reply = lambda _action, callback, on_success=None: on_success(callback())
+    app._save_empty_board_reference = lambda: saved.append(True)
+
+    DiagnosticApp._capture_empty_board(app)
+
+    assert turntable_calls == [6000]
+    assert app.turntable_duty == 6000
+    assert saved == [True]
 
 
 def test_board_corner_overlay_hides_after_clean_timeout(monkeypatch) -> None:

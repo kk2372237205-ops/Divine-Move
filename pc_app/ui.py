@@ -26,6 +26,7 @@ from .services.camera import CameraService
 from .services.hardware import HardwareCancelled, HardwareDebugError, HardwareDebugSession, HardwareReply
 from .services.ports import list_serial_ports
 from .session_log import SessionEventLog
+from .voice import announce as announce_voice
 from .vision import (
     BoardObstruction,
     BoardStoneRecognizer,
@@ -115,6 +116,9 @@ class DiagnosticApp:
         self.game_pending_move: tuple[int, int] | None = None
         self.game_action_timeout_after_id: str | None = None
         self.game_confirmation_timeout_after_id: str | None = None
+        # None means this app has not sent a turntable position command yet.
+        # It avoids claiming knowledge of a position retained across restarts.
+        self.turntable_duty: int | None = None
         self.foundation_target_labels = {target_label(key): key for key, _, _ in FOUNDATION_TARGETS}
         self.foundation_target_var = tk.StringVar(value=next(iter(self.foundation_target_labels)))
         self.foundation_target_xyz_vars = [tk.StringVar() for _ in range(3)]
@@ -137,6 +141,8 @@ class DiagnosticApp:
         self.game_phase_var = tk.StringVar(value="干运行未启动")
         self.game_message_var = tk.StringVar(value="视觉、AI 与动作规划均处于断开状态。")
         self.game_plan_var = tk.StringVar(value="不会发送机械臂、转盘或气泵命令。")
+        self.match_result_var = tk.StringVar(value="等待对局开始")
+        self.match_voice_enabled_var = tk.BooleanVar(value=True)
         self.game_hardware_enabled_var = tk.BooleanVar(value=False)
         # This is intentionally separate from the one-shot supervised control.
         # A team may explicitly arm it once at the beginning of a match, after
@@ -169,6 +175,22 @@ class DiagnosticApp:
         style.configure("Header.TLabel", font=("Microsoft YaHei UI", 16, "bold"), foreground="#123042")
         style.configure("Muted.TLabel", foreground="#52616b")
         style.configure("Status.TLabel", foreground="#086b5f")
+        style.configure(
+            "MatchResult.TLabel",
+            font=("Microsoft YaHei UI", 18, "bold"),
+            foreground="#075f45",
+            background="#e4f4ed",
+            padding=(14, 8),
+            anchor="center",
+        )
+        style.configure(
+            "MatchPending.TLabel",
+            font=("Microsoft YaHei UI", 13, "bold"),
+            foreground="#335365",
+            background="#edf3f6",
+            padding=(12, 7),
+            anchor="center",
+        )
         style.configure("TButton", padding=(10, 6))
         style.configure("Danger.TButton", foreground="#8a3b12")
 
@@ -321,58 +343,63 @@ class DiagnosticApp:
         self._build_game_dry_run_tab(game_tab)
 
     def _build_game_dry_run_tab(self, tab: ttk.Frame) -> None:
-        """Show the competition-facing loop without authorizing motion."""
+        """Build the competition workflow in the order an operator uses it."""
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(2, weight=1)
 
-        overview = ttk.LabelFrame(tab, text="视觉 → AI → 动作计划（默认只读）", padding=10)
+        overview = ttk.LabelFrame(tab, text="进阶赛操作台", padding=10)
         overview.grid(row=0, column=0, sticky="ew")
-        ttk.Label(
-            overview,
-            text=(
-                "默认仅生成 AI 黑棋建议和已标定动作计划。调试时可手动启用“受监督执行”并单次执行；"
-                "比赛时可在完成现场验收后一次性授权“比赛自动执行”，由视觉确认的每个黑棋回合自动取放。"
-                "两种模式都必须在动作后由视觉确认落子，否则安全停止。"
-            ),
-            style="Muted.TLabel",
-            wraplength=570,
-            justify="left",
-        ).pack(anchor="w")
-        controls = ttk.Frame(overview)
-        controls.pack(fill="x", pady=(8, 0))
-        ttk.Button(controls, text="保存空棋盘基准", command=self._capture_empty_board).pack(side="left")
-        ttk.Button(controls, text="开始干运行", command=self._start_dry_run).pack(side="left")
-        ttk.Button(controls, text="停止干运行", command=self._stop_dry_run).pack(side="left", padx=(8, 0))
-        ttk.Button(controls, text="准备下一局（先清空实体棋盘）", command=self._prepare_next_match).pack(
-            side="left", padx=(8, 0)
-        )
-        ttk.Button(controls, text="识别当前帧", command=lambda: self._recognize_board(False)).pack(side="left", padx=(8, 0))
-        execution_controls = ttk.Frame(overview)
-        execution_controls.pack(fill="x", pady=(6, 0))
+        overview.columnconfigure(0, weight=1)
+        overview.columnconfigure(1, weight=1)
+
+        prepare = ttk.LabelFrame(overview, text="1. 准备棋盘", padding=8)
+        prepare.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ttk.Button(prepare, text="保存空盘基准", command=self._capture_empty_board).pack(side="left")
+        ttk.Button(prepare, text="识别当前棋局", command=lambda: self._recognize_board(False)).pack(side="left", padx=(8, 0))
+
+        match = ttk.LabelFrame(overview, text="2. 开始或重置", padding=8)
+        match.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        ttk.Button(match, text="开始对局", command=self._start_dry_run).pack(side="left")
+        ttk.Button(match, text="停止对局", command=self._stop_dry_run).pack(side="left", padx=(8, 0))
+        ttk.Button(match, text="准备下一局", command=self._prepare_next_match).pack(side="left", padx=(8, 0))
+
+        execution = ttk.LabelFrame(overview, text="3. 执行控制", padding=8)
+        execution.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Checkbutton(
-            execution_controls,
-            text="受监督执行（默认关闭）",
+            execution,
+            text="受监督执行",
             variable=self.game_hardware_enabled_var,
             command=self._on_game_execution_toggle,
         ).pack(side="left")
-        ttk.Button(execution_controls, text="执行本次黑棋", command=self._execute_game_plan).pack(side="left", padx=(8, 0))
+        ttk.Button(execution, text="执行本次黑棋", command=self._execute_game_plan).pack(side="left", padx=(8, 0))
         ttk.Checkbutton(
-            execution_controls,
-            text="比赛自动执行（一次授权）",
+            execution,
+            text="比赛自动执行",
             variable=self.game_auto_execution_var,
             command=self._on_game_auto_execution_toggle,
         ).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(execution, text="胜负语音", variable=self.match_voice_enabled_var).pack(side="left", padx=(8, 0))
         ttk.Button(
-            execution_controls,
+            execution,
             text="紧急停止本手",
             command=self._emergency_stop_game_action,
             style="Danger.TButton",
         ).pack(side="left", padx=(8, 0))
-        ttk.Label(overview, textvariable=self.game_phase_var, style="Status.TLabel", wraplength=570).pack(anchor="w", pady=(8, 0))
-        ttk.Label(overview, textvariable=self.game_message_var, style="Muted.TLabel", wraplength=570).pack(anchor="w", pady=(4, 0))
+        ttk.Label(overview, textvariable=self.game_phase_var, style="Status.TLabel").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(overview, textvariable=self.game_message_var, style="Muted.TLabel", wraplength=570).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(3, 0)
+        )
 
         board_frame = ttk.LabelFrame(tab, text="实时 13×13 棋局（竞赛坐标：右上为 (1,1)）", padding=8)
         board_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.match_result_label = ttk.Label(
+            board_frame,
+            textvariable=self.match_result_var,
+            style="MatchPending.TLabel",
+        )
+        self.match_result_label.pack(fill="x", padx=4, pady=(0, 8))
         self.game_canvas = tk.Canvas(board_frame, width=330, height=330, background="#deb887", highlightthickness=0)
         self.game_canvas.pack(anchor="center")
 
@@ -1364,6 +1391,31 @@ class DiagnosticApp:
         if self.last_frame is None:
             self.status_var.set("请先启动摄像头预览，再保存空棋盘基准图。")
             return
+        if self.hardware_busy:
+            self.status_var.set("硬件动作尚未结束，请等待转盘或机械臂回执后再保存空盘基准。")
+            return
+        receive_duty = self.foundation_calibration.turntable_receive_duty
+        must_return_turntable = self.hardware.connected and self.turntable_duty != receive_duty
+        if must_return_turntable:
+            self.status_var.set("保存空盘前正在将转盘回料仓位，请等待回执……")
+            self._hardware_reply(
+                "保存空盘前转盘回料仓位",
+                lambda: self.hardware.turntable(receive_duty),
+                on_success=lambda _reply: DiagnosticApp._finish_empty_board_turntable_return(self, receive_duty),
+            )
+            return
+        if self.turntable_duty is not None and self.turntable_duty != receive_duty:
+            self.status_var.set("转盘未在料仓位且调试串口未连接；请先连接 DEBUG 后再保存空盘基准。")
+            return
+        self._save_empty_board_reference()
+
+    def _finish_empty_board_turntable_return(self, receive_duty: int) -> None:
+        DiagnosticApp._set_turntable_state(self, "料仓位", receive_duty)
+        DiagnosticApp._record_session_event(self, "turntable_returned_for_empty_board", duty=receive_duty)
+        self._save_empty_board_reference()
+
+    def _save_empty_board_reference(self) -> None:
+        """Persist the visual baseline only after the tray is safe or unavailable."""
         calibration = self._current_calibration()
         if calibration is None:
             self.status_var.set("请先完成四角棋盘标定，再保存空棋盘基准图。")
@@ -1465,16 +1517,28 @@ class DiagnosticApp:
         self.game_finished = False
         self.game_pending_move = None
         self._cancel_game_timers()
+        DiagnosticApp._set_match_result_banner(self, "对局进行中：等待稳定棋局", finished=False)
         self.game_phase_var.set("干运行已启动：等待三帧一致的摄像头棋局。")
-        calibration_note = "已加载四角机械臂标定。" if self.advanced_arm_calibration is not None else "未找到四角机械臂标定，动作计划仅作坐标建议。"
-        self.game_message_var.set(
-            f"默认不会发送硬件命令。对局中允许手和棋子在棋盘内移动，"
-            f"仅在三帧一致后更新棋局。{calibration_note}"
-        )
+        self.game_message_var.set("等待摄像头连续三帧确认当前棋局。")
         self.game_plan_var.set("等待稳定棋局后由 AI 生成黑棋建议。")
         self._draw_game_board(GomokuBoard())
         self.status_var.set("进阶赛对局已启动：默认只读；受监督执行开关关闭时不会驱动硬件。")
         DiagnosticApp._record_session_event(self, "advanced_match_started", automatic_authorized=False)
+
+    def _set_match_result_banner(self, text: str, *, finished: bool) -> None:
+        """Keep the operator-facing result adjacent to the virtual board."""
+        result_var = getattr(self, "match_result_var", None)
+        if result_var is not None:
+            result_var.set(text)
+        label = getattr(self, "match_result_label", None)
+        if label is not None:
+            label.configure(style="MatchResult.TLabel" if finished else "MatchPending.TLabel")
+
+    def _announce_match_result(self, text: str) -> None:
+        voice_enabled = getattr(self, "match_voice_enabled_var", None)
+        if voice_enabled is None or not voice_enabled.get():
+            return
+        threading.Thread(target=announce_voice, args=(text,), name="match-result-voice", daemon=True).start()
 
     def _stop_dry_run(self) -> None:
         if self.game_action_in_progress:
@@ -1484,6 +1548,7 @@ class DiagnosticApp:
         self.game_auto_execution_var.set(False)
         self.game_waiting_visual_confirmation = False
         self._cancel_game_timers()
+        DiagnosticApp._set_match_result_banner(self, "对局已停止", finished=False)
         self.game_phase_var.set("干运行已停止")
         self.game_message_var.set("视觉预览可继续使用；不会再生成新的 AI 动作计划。")
         self.status_var.set("进阶赛干运行已停止；未发送任何硬件命令。")
@@ -1514,10 +1579,11 @@ class DiagnosticApp:
         self.reference_invalidated = True
         self.recognizer.reset_reference_cache()
         self._draw_game_board(GomokuBoard())
+        DiagnosticApp._set_match_result_banner(self, "请清空实体棋盘后开始下一局", finished=False)
         self.game_phase_var.set("准备下一局：请先清空实体棋盘")
         self.game_message_var.set("UI 已清空且自动执行已撤销；请手动移走所有棋子。")
-        self.game_plan_var.set("清空实体棋盘后，点击“保存空棋盘基准”，再开始干运行。")
-        self.status_var.set("已准备下一局：未发送硬件命令。请清空实体棋盘并重新保存空棋盘基准。")
+        self.game_plan_var.set("清空实体棋盘后，点击“保存空盘基准”，再开始对局。")
+        self.status_var.set("已准备下一局：未发送硬件命令。请清空实体棋盘并重新保存空盘基准。")
         DiagnosticApp._record_session_event(self, "advanced_match_reset_for_next_game")
 
     def _apply_gameflow_update(self, update: GameFlowUpdate) -> None:
@@ -1569,6 +1635,14 @@ class DiagnosticApp:
         self.game_phase_var.set("当前阶段：对局结束")
         self.game_message_var.set(f"{update.message} 本局已正常结束，不会再执行机械臂动作。")
         self.game_plan_var.set("对局结果已确认。清空棋盘、重新保存空棋盘基准后，才可开始下一局。")
+        if "机器人获胜" in update.message:
+            result = "机器人获胜！"
+        elif "人类获胜" in update.message:
+            result = "人类获胜！"
+        else:
+            result = "本局平局"
+        DiagnosticApp._set_match_result_banner(self, result, finished=True)
+        DiagnosticApp._announce_match_result(self, result)
         self._draw_game_board(update.board)
         self.status_var.set(f"进阶赛对局正常结束：{update.message}")
         DiagnosticApp._record_session_event(
@@ -1676,6 +1750,9 @@ class DiagnosticApp:
     def _begin_game_visual_confirmation(self, move: tuple[int, int]) -> None:
         self._cancel_game_action_timeout()
         self.game_action_in_progress = False
+        # pick_and_place ends by returning the turntable to its receive/storage
+        # position, so later empty-board capture does not rotate it again.
+        self.turntable_duty = self.foundation_calibration.turntable_receive_duty
         self.game_waiting_visual_confirmation = True
         self.game_pending_move = move
         self.board_tracker.reset()
@@ -1884,6 +1961,7 @@ class DiagnosticApp:
         )
 
     def _set_turntable_state(self, position: str, duty: int) -> None:
+        self.turntable_duty = duty
         self.servo_var.set(f"取子机构舵机调试台：已发送 {position}，占空比 {duty}")
 
     def _pump(self, state: int, action: str) -> None:

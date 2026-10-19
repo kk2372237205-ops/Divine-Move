@@ -203,6 +203,8 @@ def test_legal_game_finish_cancels_pending_confirmation_without_safety_fault() -
         game_phase_var=_Variable(),
         game_message_var=_Variable(),
         game_plan_var=_Variable(),
+        match_result_var=_Variable(),
+        match_voice_enabled_var=_Variable(False),
         status_var=_Variable(),
     )
     app._cancel_game_timers = lambda: None
@@ -219,3 +221,4 @@ def test_legal_game_finish_cancels_pending_confirmation_without_safety_fault() -
     assert not app.game_hardware_enabled_var.get()
     assert not app.game_auto_execution_var.get()
     assert "正常结束" in app.status_var.value
+    assert app.match_result_var.get() == "人类获胜！"
