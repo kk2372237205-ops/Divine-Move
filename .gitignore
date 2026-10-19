@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+captures/
+calibration/*.json
+
+# Local hardware state, generated data and handoff artifacts.
+# These remain on the workstation and are deliberately not versioned.
+.vscode/
+_materials_readonly/
+calibration/
+captures/
+dataset/
+handoff_exports/
+logs/
+tmp/
+PROJECT_HANDOFF_MANIFEST.json
