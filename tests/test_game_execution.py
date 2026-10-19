@@ -56,6 +56,35 @@ def test_automatic_game_plan_cannot_send_hardware_without_match_authorization() 
     assert not calls
 
 
+def test_formal_match_start_is_the_single_automatic_execution_authorization() -> None:
+    started = []
+    events = []
+    app = SimpleNamespace(
+        game_action_in_progress=False,
+        hardware_busy=False,
+        last_frame=object(),
+        calibration_invalidated=False,
+        reference_invalidated=False,
+        hardware=SimpleNamespace(connected=True),
+        recognizer=SimpleNamespace(has_reference=True),
+        game_hardware_enabled_var=_Variable(True),
+        game_auto_execution_var=_Variable(False),
+        status_var=_Variable(),
+        session_log=SimpleNamespace(record=lambda event, **details: events.append((event, details))),
+        dry_run_enabled=False,
+    )
+    app._current_calibration = lambda: object()
+    app._start_dry_run = lambda: (started.append(True), setattr(app, "dry_run_enabled", True))
+
+    DiagnosticApp._start_automatic_match(app)
+
+    assert started == [True]
+    assert not app.game_hardware_enabled_var.get()
+    assert app.game_auto_execution_var.get()
+    assert "自动执行" in app.status_var.get()
+    assert ("automatic_execution_authorized", {"source": "formal_match_start"}) in events
+
+
 def test_game_plan_uses_verified_arm_calibration_after_all_preflight_checks() -> None:
     calibration = _arm_calibration()
     plan = MotionPlanner(calibration).plan_black_move((6, 6))

@@ -108,6 +108,8 @@ def test_prepare_next_match_disarms_automation_and_requires_fresh_empty_board() 
     assert not app.game_hardware_enabled_var.get()
     assert not app.game_auto_execution_var.get()
     assert app.reference_invalidated
+    assert app.board_clearance_in_progress
+    assert app.board_obstructions == ()
     assert app.game_phase_var.get() == "准备下一局：请先清空实体棋盘"
     assert "保存空盘基准" in app.game_plan_var.get()
     assert len(rendered_boards) == 1
@@ -433,6 +435,7 @@ def test_saving_empty_board_returns_an_extended_turntable_to_storage_first() -> 
     )
     app._hardware_reply = lambda _action, callback, on_success=None: on_success(callback())
     app._save_empty_board_reference = lambda: saved.append(True)
+    app._empty_board_ready_for_capture = lambda: True
 
     DiagnosticApp._capture_empty_board(app)
 

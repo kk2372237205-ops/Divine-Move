@@ -46,3 +46,6 @@ def test_dry_run_disables_empty_board_runtime_guards() -> None:
     """Hands and normal stones are expected during a no-hardware dry run."""
     assert not DiagnosticApp._runtime_board_guards_enabled(SimpleNamespace(dry_run_enabled=True))
     assert DiagnosticApp._runtime_board_guards_enabled(SimpleNamespace(dry_run_enabled=False))
+    assert not DiagnosticApp._runtime_board_guards_enabled(
+        SimpleNamespace(dry_run_enabled=False, board_clearance_in_progress=True)
+    )

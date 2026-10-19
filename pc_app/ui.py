@@ -91,6 +91,10 @@ class DiagnosticApp:
         self.corner_overlay_until = 0.0
         self.obstruction_last_checked = 0.0
         self.obstruction_check_interval = 0.6
+        # While the operator is physically clearing a completed board, the
+        # empty-board guard is intentionally paused.  A single explicit check
+        # runs again when they save the next empty-board baseline.
+        self.board_clearance_in_progress = False
         self.dataset_lighting_var = tk.StringVar(value="正常")
         self.dataset_edge_var = tk.BooleanVar(value=False)
         self.dataset_scene_var = tk.StringVar(value="")
@@ -355,29 +359,24 @@ class DiagnosticApp:
         prepare = ttk.LabelFrame(overview, text="1. 准备棋盘", padding=8)
         prepare.grid(row=0, column=0, sticky="ew", padx=(0, 5))
         ttk.Button(prepare, text="保存空盘基准", command=self._capture_empty_board).pack(side="left")
-        ttk.Button(prepare, text="识别当前棋局", command=lambda: self._recognize_board(False)).pack(side="left", padx=(8, 0))
 
-        match = ttk.LabelFrame(overview, text="2. 开始或重置", padding=8)
+        match = ttk.LabelFrame(overview, text="2. 正式比赛", padding=8)
         match.grid(row=0, column=1, sticky="ew", padx=(5, 0))
-        ttk.Button(match, text="开始对局", command=self._start_dry_run).pack(side="left")
-        ttk.Button(match, text="停止对局", command=self._stop_dry_run).pack(side="left", padx=(8, 0))
+        ttk.Button(match, text="开始比赛（自动执行）", command=self._start_automatic_match).pack(side="left")
+        ttk.Button(match, text="停止比赛", command=self._stop_dry_run).pack(side="left", padx=(8, 0))
         ttk.Button(match, text="准备下一局", command=self._prepare_next_match).pack(side="left", padx=(8, 0))
 
-        execution = ttk.LabelFrame(overview, text="3. 执行控制", padding=8)
+        execution = ttk.LabelFrame(overview, text="调试（不计入正式比赛）", padding=8)
         execution.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(execution, text="识别当前棋局", command=lambda: self._recognize_board(False)).pack(side="left")
+        ttk.Button(execution, text="启动调试对局", command=self._start_debug_match).pack(side="left", padx=(8, 0))
         ttk.Checkbutton(
             execution,
             text="受监督执行",
             variable=self.game_hardware_enabled_var,
             command=self._on_game_execution_toggle,
-        ).pack(side="left")
-        ttk.Button(execution, text="执行本次黑棋", command=self._execute_game_plan).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(
-            execution,
-            text="比赛自动执行",
-            variable=self.game_auto_execution_var,
-            command=self._on_game_auto_execution_toggle,
         ).pack(side="left", padx=(8, 0))
+        ttk.Button(execution, text="执行本次黑棋", command=self._execute_game_plan).pack(side="left", padx=(8, 0))
         ttk.Checkbutton(execution, text="胜负语音", variable=self.match_voice_enabled_var).pack(side="left", padx=(8, 0))
         ttk.Button(
             execution,
@@ -1364,14 +1363,16 @@ class DiagnosticApp:
         return False
 
     def _runtime_board_guards_enabled(self) -> bool:
-        """Keep empty-board and drift guards out of a live dry-run game.
+        """Keep empty-board and drift guards out of a live or clearing game.
 
         Dry run has no hardware I/O.  Its stable-three-frame recognizer is
         the appropriate gate while a person is deliberately reaching into
-        the board.  A camera/support move still requires ending the game and
-        calibrating again before any hardware workflow is used.
+        the board.  The same is true immediately after "准备下一局": the
+        operator must be able to remove pieces without expensive red-box
+        detection stuttering the preview.  Saving the next empty-board
+        baseline performs a one-time geometry and obstruction check instead.
         """
-        return not self.dry_run_enabled
+        return not self.dry_run_enabled and not getattr(self, "board_clearance_in_progress", False)
 
     def _invalidate_calibration(self, reason: str) -> None:
         self.calibration_invalidated = True
@@ -1390,6 +1391,8 @@ class DiagnosticApp:
     def _capture_empty_board(self) -> None:
         if self.last_frame is None:
             self.status_var.set("请先启动摄像头预览，再保存空棋盘基准图。")
+            return
+        if not self._empty_board_ready_for_capture():
             return
         if self.hardware_busy:
             self.status_var.set("硬件动作尚未结束，请等待转盘或机械臂回执后再保存空盘基准。")
@@ -1414,6 +1417,23 @@ class DiagnosticApp:
         DiagnosticApp._record_session_event(self, "turntable_returned_for_empty_board", duty=receive_duty)
         self._save_empty_board_reference()
 
+    def _empty_board_ready_for_capture(self) -> bool:
+        """Perform the paused clearance check once, immediately before saving."""
+        calibration = self._current_calibration()
+        if calibration is None:
+            # _save_empty_board_reference keeps the existing user-facing
+            # calibration message as the single source of truth.
+            return True
+        try:
+            clearance = detect_board_obstructions(self.last_frame, calibration)
+        except ValueError as error:
+            self.status_var.set(f"无法核验空棋盘：{error}")
+            return False
+        if clearance.obstructions:
+            self.status_var.set("棋盘仍检测到手、棋子或异物；请清空并移开手后再保存空盘基准。")
+            return False
+        return self._monitor_calibration_drift(force=True)
+
     def _save_empty_board_reference(self) -> None:
         """Persist the visual baseline only after the tray is safe or unavailable."""
         calibration = self._current_calibration()
@@ -1429,6 +1449,9 @@ class DiagnosticApp:
         self.board_tracker.reset()
         self.reference_invalidated = False
         self.last_vision_result = None
+        self.board_clearance_in_progress = False
+        self.board_obstructions = ()
+        self.corner_overlay_until = 0.0
         self.vision_var.set("视觉识别：空棋盘基准已保存。落子后可点击识别，或开启自动识别。")
         self.status_var.set(f"空棋盘基准图已保存：{path.name}。{self._hardware_connection_text()}")
 
@@ -1506,6 +1529,7 @@ class DiagnosticApp:
             self.status_var.set("当前黑棋动作尚未结束，不能重置对局。")
             return
         self.dry_run_enabled = True
+        self.board_clearance_in_progress = False
         self.dry_run_last_recognition = 0.0
         self.game_controller.reset()
         self.board_tracker.reset()
@@ -1523,7 +1547,40 @@ class DiagnosticApp:
         self.game_plan_var.set("等待稳定棋局后由 AI 生成黑棋建议。")
         self._draw_game_board(GomokuBoard())
         self.status_var.set("进阶赛对局已启动：默认只读；受监督执行开关关闭时不会驱动硬件。")
-        DiagnosticApp._record_session_event(self, "advanced_match_started", automatic_authorized=False)
+        DiagnosticApp._record_session_event(
+            self,
+            "advanced_match_started",
+            automatic_authorized=DiagnosticApp._game_auto_execution_enabled(self),
+        )
+
+    def _start_debug_match(self) -> None:
+        """Start a visual-only match for the grouped manual debug controls."""
+        self.game_auto_execution_var.set(False)
+        self._start_dry_run()
+
+    def _start_automatic_match(self) -> None:
+        """Treat one explicit formal-match click as the automatic authorization."""
+        if self.game_action_in_progress or self.hardware_busy:
+            self.status_var.set("机械臂动作尚未结束，不能开始比赛。")
+            return
+        if self.last_frame is None:
+            self.status_var.set("未开始比赛：请先启动摄像头预览。")
+            return
+        if self.calibration_invalidated or self._current_calibration() is None:
+            self.status_var.set("未开始比赛：请先在当前机位完成自动找棋盘。")
+            return
+        if self.reference_invalidated or not self.recognizer.has_reference:
+            self.status_var.set("未开始比赛：请先清空棋盘并保存空盘基准。")
+            return
+        if not self.hardware.connected:
+            self.status_var.set("未开始比赛：请先连接机械臂 DEBUG 端口。")
+            return
+        self.game_hardware_enabled_var.set(False)
+        self.game_auto_execution_var.set(True)
+        self._start_dry_run()
+        if self.dry_run_enabled:
+            self.status_var.set("比赛已开始：已一次授权自动执行，首个稳定黑棋回合将自动取放。")
+            DiagnosticApp._record_session_event(self, "automatic_execution_authorized", source="formal_match_start")
 
     def _set_match_result_banner(self, text: str, *, finished: bool) -> None:
         """Keep the operator-facing result adjacent to the virtual board."""
@@ -1578,6 +1635,9 @@ class DiagnosticApp:
         self._cancel_game_timers()
         self.reference_invalidated = True
         self.recognizer.reset_reference_cache()
+        self.board_clearance_in_progress = True
+        self.board_obstructions = ()
+        self.corner_overlay_until = 0.0
         self._draw_game_board(GomokuBoard())
         DiagnosticApp._set_match_result_banner(self, "请清空实体棋盘后开始下一局", finished=False)
         self.game_phase_var.set("准备下一局：请先清空实体棋盘")
